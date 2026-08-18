@@ -1,0 +1,16 @@
+# environment
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# DATA — never commit anything containing real records
+data/
+*.csv
+*.parquet
+*.json
+!requirements.json
+
+# secrets — the salt can re-link pseudonyms to people
+.env
+*.salt
