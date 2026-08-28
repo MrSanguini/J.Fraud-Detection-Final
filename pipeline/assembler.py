@@ -1,5 +1,5 @@
 """
-assembler.py — Phase D: build the final training table.
+assembler.py, Phase D: build the final training table.
 
 Joins transfers + user + recipient + labels, derives features, and computes
 behavioural aggregates.
@@ -10,27 +10,33 @@ Every feature for a transaction at time T must be computable using ONLY
 information available at time T.
 
 Enforced by:
-  * rolling windows use closed="left" — a transaction is never counted in its
-    own velocity aggregate;
-  * recipient history uses cumcount() — counts PRIOR sends only;
+  * rolling windows use closed="left", so a transaction is never counted in
+    its own velocity aggregate;
+  * recipient history uses cumcount(), counting PRIOR sends only;
   * user/recipient documents are NOT snapshotted historically, so only
     IMMUTABLE/STATIC fields (creation dates) are trusted on old records.
-    Tier-2 mutable fields are included conditionally and are NaN on old rows —
-    the intended graceful degradation.
+    Tier-2 mutable fields are included conditionally and are NaN on old rows;
+    that is the intended graceful degradation.
 
 Identities are dropped at the end: they do their job during aggregation and
 never reach the model.
 """
 
+import logging
+import re
+import time
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 
-from common import read_table, write_table
+import config
+from common import read_table, setup_logging, write_table
 
 from pathlib import Path as _P
 ROOT = _P(__file__).resolve().parent.parent
+
+logger = logging.getLogger(__name__)
+
 
 def _resolve(p):
     """Resolve a path against the project root unless already absolute."""
@@ -40,6 +46,15 @@ def _resolve(p):
 
 TIME = "_t"
 
+# description_code mixes two formats (README "Known limitations"): a short
+# numeric purpose code on newer records, and a 24-char hex Mongo ObjectId
+# string on older ones -- apparently a leftover FK to a purpose-lookup
+# collection that got inlined later. LEGACY_RATE_ALERT is the threshold
+# past which that legacy format is treated as dominant and worth raising
+# with whoever owns the field, per normalize_description_code() below.
+_OBJECTID_RE = re.compile(r"^[0-9a-f]{24}$", re.IGNORECASE)
+LEGACY_RATE_ALERT = 0.5
+
 
 # ── derivations from parked _raw_ values ─────────────────────────────────────
 def derive_time_features(df: pd.DataFrame, time_col="date") -> pd.DataFrame:
@@ -47,8 +62,8 @@ def derive_time_features(df: pd.DataFrame, time_col="date") -> pd.DataFrame:
     t = pd.to_datetime(out[time_col], errors="coerce", utc=True, format="mixed")
     bad = t.isna().sum()
     if bad:
-        print(f"[WARN] {bad} rows have an unparseable transaction date — they "
-              f"cannot be ordered and will sort last.")
+        logger.warning(f"{bad} rows have an unparseable transaction date, so they "
+                       f"cannot be ordered and will sort last.")
     out[TIME] = t
     out["hour"] = t.dt.hour.astype("Int16")
     out["weekday"] = t.dt.dayofweek.astype("Int16")
@@ -71,8 +86,8 @@ def add_account_ages(df: pd.DataFrame) -> pd.DataFrame:
         out[name] = days / 365.25 if name.endswith("_years") else days
         neg = (out[name] < 0).sum()
         if neg:
-            print(f"[WARN] {neg} rows have negative {name} — the referenced "
-                  f"record was created AFTER the transaction. Check timestamps.")
+            logger.warning(f"{neg} rows have negative {name}: the referenced "
+                           f"record was created AFTER the transaction. Check timestamps.")
     return out
 
 
@@ -106,7 +121,7 @@ def derive_transfer_features(df: pd.DataFrame) -> pd.DataFrame:
             lambda v: len(v) if isinstance(v, (list, np.ndarray)) else 0)
 
     if "_raw_isEnabled3Ds" in out.columns:
-        # null means the partner never reported it — that nullness is informative
+        # null means the partner never reported it, and that nullness is informative
         out["threeds_reported"] = out["_raw_isEnabled3Ds"].notna().astype(int)
 
     if "_raw_ipDetails__location__country" in out.columns and "sending_from" in out.columns:
@@ -127,32 +142,84 @@ def derive_transfer_features(df: pd.DataFrame) -> pd.DataFrame:
     return out.drop(columns=[c for c in out.columns if "_raw_" in c])
 
 
+def normalize_description_code(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse the legacy-ObjectId variant of description_code into one
+    "legacy" bucket, so the column stays a small, sensible categorical
+    instead of fragmenting into (near-)unique ObjectId strings a model
+    can't learn anything from.
+
+    There is no lookup table in this repo mapping those ObjectIds back to
+    their real purpose code; if one becomes available (e.g. from whoever
+    owns the field), replace the bucket below with a real join. Until
+    then, logs the short-code/legacy/missing ratio every run, and warns
+    if legacy is the majority format, since bucketing more than half the
+    column into one value is a real signal-loss problem worth escalating,
+    not something to silently absorb."""
+    out = df.copy()
+    col = "description_code"
+    if col not in out.columns:
+        return out
+
+    raw = out[col].astype("string")
+    is_legacy = raw.fillna("").str.match(_OBJECTID_RE)
+
+    total = len(raw)
+    legacy_n = int(is_legacy.sum())
+    missing_n = int(raw.isna().sum())
+    known_n = total - legacy_n - missing_n
+
+    if total:
+        legacy_rate = legacy_n / total
+        logger.info(f"[description_code] {known_n:,} short-code ({known_n/total*100:.1f}%), "
+                    f"{legacy_n:,} legacy ObjectId ({legacy_rate*100:.1f}%), "
+                    f"{missing_n:,} missing ({missing_n/total*100:.1f}%)")
+        if legacy_rate > LEGACY_RATE_ALERT:
+            logger.warning(f"[description_code] legacy ObjectId format is "
+                           f"{legacy_rate*100:.1f}% of records: more than half. Bucketing "
+                           f"that many rows into one 'legacy' value destroys most of the "
+                           f"column's signal; raise this with whoever owns description_code "
+                           f"rather than relying on the bucket long-term.")
+
+    out[col] = raw.mask(is_legacy, "legacy")
+    return out
+
+
 # ── point-in-time behavioural aggregates ─────────────────────────────────────
 def add_velocity_features(df: pd.DataFrame, key="user_id",
-                          windows=(1, 24, 168)) -> pd.DataFrame:
+                          windows=None) -> pd.DataFrame:
     """Rolling counts/sums over PRIOR transactions for the same key.
 
     closed="left" excludes the current row from its own aggregate. This single
-    parameter is the main leakage guard in the pipeline."""
-    out = df.sort_values(TIME).copy()
+    parameter is the main leakage guard in the pipeline.
+
+    `windows` (hours) defaults to config.VELOCITY_WINDOWS_HOURS.
+
+    Implemented with pandas' native grouped rolling (C-level) rather than a
+    per-group Python loop: on 100k rows the loop took ~66s, this takes <1s.
+    """
+    windows = windows or config.VELOCITY_WINDOWS_HOURS
+    out = df.sort_values([key, TIME]).copy()
     if key not in out.columns or out[TIME].isna().all():
         return out
 
     out = out.reset_index(drop=True)
+    valid = out[TIME].notna()
+    work = out.loc[valid, [key, TIME, "send_amount"]].copy()
+    work["send_amount"] = pd.to_numeric(work["send_amount"], errors="coerce")
+
     for hours in windows:
         cnt_col, sum_col = f"{key}_txn_{hours}h", f"{key}_amt_{hours}h"
-        counts = pd.Series(np.nan, index=out.index)
-        sums = pd.Series(np.nan, index=out.index)
-        for _, grp in out.groupby(key, sort=False):
-            g = grp.dropna(subset=[TIME])
-            if g.empty:
-                continue
-            ser = g.set_index(TIME)["send_amount"].astype(float)
-            r = ser.rolling(f"{hours}h", closed="left")
-            counts.loc[g.index] = r.count().to_numpy()
-            sums.loc[g.index] = r.sum().to_numpy()
-        out[cnt_col] = counts.fillna(0)
-        out[sum_col] = sums.fillna(0.0)
+        # grouped rolling on a time index; result carries a (key, time) MultiIndex
+        roll = (work.set_index(TIME)
+                    .groupby(key)["send_amount"]
+                    .rolling(f"{hours}h", closed="left"))
+        counts = roll.count().reset_index(level=0, drop=True)
+        sums = roll.sum().reset_index(level=0, drop=True)
+        # realign: the rolling result is ordered as the grouped frame was
+        out.loc[valid, cnt_col] = counts.to_numpy()
+        out.loc[valid, sum_col] = sums.to_numpy()
+        out[cnt_col] = out[cnt_col].fillna(0)
+        out[sum_col] = out[sum_col].fillna(0.0)
     return out
 
 
@@ -169,8 +236,8 @@ def add_recipient_history(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ── assembly ─────────────────────────────────────────────────────────────────
-def assemble(extracted_dir="data/extracted") -> pd.DataFrame:
-    d = _resolve(extracted_dir)
+def assemble(extracted_dir=None) -> pd.DataFrame:
+    d = _resolve(extracted_dir or config.EXTRACTED_DIR)
     tr = read_table(d / "transfer")
     lb = read_table(d / "labels")
     try:
@@ -199,11 +266,11 @@ def assemble(extracted_dir="data/extracted") -> pd.DataFrame:
     ucol, rcol = "user__raw_dateCreated", "recipient__raw_date_created"
     um = df[ucol].notna().mean()*100 if ucol in df.columns else float("nan")
     rm = df[rcol].notna().mean()*100 if rcol in df.columns else float("nan")
-    print(f"[assemble] {len(df):,} transfers | user match {um:.1f}% | "
-          f"recipient match {rm:.1f}%")
+    logger.info(f"[assemble] {len(df):,} transfers | user match {um:.1f}% | "
+                f"recipient match {rm:.1f}%")
     if um < 50 or rm < 50:
-        print("   [WARN] low join match rate — check that user/recipient exports "
-              "cover the same period as the transfers.")
+        logger.warning("low join match rate; check that user/recipient exports "
+                       "cover the same period as the transfers.")
 
     # ORDER MATTERS: time first (ages need _t), then age/user derivations
     # (they consume _raw_ columns), then transfer derivations (which strip _raw_).
@@ -211,23 +278,36 @@ def assemble(extracted_dir="data/extracted") -> pd.DataFrame:
     df = add_account_ages(df)
     df = derive_user_features(df)
     df = derive_transfer_features(df)
+    df = normalize_description_code(df)
     df = add_velocity_features(df, key="user_id")
     df = add_recipient_history(df)
 
-    # identities and internals never reach the model
+    # Identities and internals never reach the model.
+    #
+    # META columns are deliberately RETAINED here rather than dropped:
+    #   date         drives the temporal train/val/test split
+    #   amount_paid  realised loss per fraud, consumed by the cost model
+    #   label_source provenance of each label (audit + weighting decisions)
+    # None of them are model inputs. model_prep.py excludes them from the
+    # feature matrix by construction, and test_pipeline.check_feature_matrix()
+    # asserts their absence there rather than trusting it. Dropping amount_paid
+    # at this stage would leave the cost model with nothing to compute against.
     drop = ["_id", "user_id", "recipient_id", TIME,
             "user_user_id", "recipient_user_id",
-            "partner_reference", "partner_txn_id", "amount_paid"]
+            "partner_reference", "partner_txn_id"]
     df = df.drop(columns=[c for c in drop if c in df.columns])
     return df
 
 
-def run(extracted_dir="data/extracted", out="data/training_set"):
+def run(extracted_dir=None, out=None):
+    setup_logging()
+    t0 = time.monotonic()
     df = assemble(extracted_dir)
-    out_path = write_table(df, _resolve(out))
-    print(f"[write] {out_path} — {df.shape[0]:,} rows x {df.shape[1]} cols")
+    out_path = write_table(df, _resolve(out or config.TRAINING_SET_PATH))
+    logger.info(f"[write] {out_path}, {df.shape[0]:,} rows x {df.shape[1]} cols, "
+                f"{time.monotonic()-t0:.2f}s")
     if "label" in df:
-        print(f"[label] fraud rate {df['label'].mean()*100:.3f}%")
+        logger.info(f"[label] fraud rate {df['label'].mean()*100:.3f}%")
     return df
 
 

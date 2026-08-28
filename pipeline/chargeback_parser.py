@@ -1,13 +1,14 @@
 """
-chargeback_parser.py — Phase C0: parse partner chargeback sheets into labels.
+chargeback_parser.py, Phase C0: parse partner chargeback sheets into labels.
 
 Partner-confirmed fraud is the ONLY source of "fraud the rules never caught".
 Without it the model learns to imitate the existing rules engine; with it, the
 model can improve on it.
 
-INPUT: a CSV/XLSX export from the partner (NOT screenshots — ask partners for
-the underlying file; transcribing digits from images silently corrupts labels,
-and a label error teaches the model that a legitimate transaction was fraud).
+INPUT: a CSV/XLSX export from the partner (NOT screenshots; ask partners for
+the underlying file, since transcribing digits from images silently corrupts
+labels, and a label error teaches the model that a legitimate transaction was
+fraud).
 
 Observed sheet columns:
     AGENT_CODE, AGENT_DBA, DEPOSIT_DATE, AMOUNT, DEPOSIT_NOTE,
@@ -15,7 +16,7 @@ Observed sheet columns:
     SENDING_PRINCIPAL, SENDING_DATE, RB_DATE, Observations // Patterns,
     Watch List / WL
 
-USE AS LABELS, NOT FEATURES. Almost every column is post-hoc — it exists only
+USE AS LABELS, NOT FEATURES. Almost every column is post-hoc: it exists only
 BECAUSE a chargeback happened, weeks after the transaction. Feeding any of it to
 the model is textbook target leakage. We keep only:
     FOLIO / TRNX ID  -> join keys (hashed with the SAME salt as the transfers)
@@ -24,15 +25,21 @@ the model is textbook target leakage. We keep only:
     Observations     -> coarse fraud_type, for per-typology REPORTING only
 """
 
+import logging
 import re
+import time
 from pathlib import Path
 
 import pandas as pd
 
-from common import get_salt, hash_id, write_table
+import config
+from common import get_salt, hash_id, setup_logging, write_table
 
 from pathlib import Path as _P
 ROOT = _P(__file__).resolve().parent.parent
+
+logger = logging.getLogger(__name__)
+
 
 def _resolve(p):
     """Resolve a path against the project root unless already absolute."""
@@ -56,7 +63,7 @@ COLUMN_ALIASES = {
     "watchlist":    ["watch list / wl", "watchlist", "wl"],
 }
 
-# coarse typology from free-text observations — for REPORTING, never a feature
+# coarse typology from free-text observations, for REPORTING, never a feature
 TYPOLOGY_PATTERNS = [
     ("stolen_card",       r"stolen card|lost card|card.*stolen"),
     ("no_authorization",  r"no cardholder auth|unauthori[sz]ed"),
@@ -102,7 +109,7 @@ def parse_chargebacks(df: pd.DataFrame) -> pd.DataFrame:
         )
 
     out = pd.DataFrame(index=df.index)
-    # hash BOTH keys — extractor emits partner_reference and partner_txn_id
+    # hash BOTH keys: extractor emits partner_reference and partner_txn_id
     out["partner_reference"] = (df[folio_col].apply(lambda v: hash_id(v, SALT))
                                 if folio_col else None)
     out["partner_txn_id"] = (df[txn_col].apply(lambda v: hash_id(v, SALT))
@@ -113,7 +120,7 @@ def parse_chargebacks(df: pd.DataFrame) -> pd.DataFrame:
                              if rb else pd.NaT)
 
     amt = _find_column(df, "amount")
-    # chargebacks are debits, often negative — compare magnitudes
+    # chargebacks are debits, often negative, so compare magnitudes
     out["chargeback_amount"] = (pd.to_numeric(df[amt], errors="coerce").abs()
                                 if amt else pd.NA)
 
@@ -123,20 +130,20 @@ def parse_chargebacks(df: pd.DataFrame) -> pd.DataFrame:
         out["fraud_type"] = df[code].astype("string")     # structured beats prose
     elif obs:
         out["fraud_type"] = df[obs].apply(classify_typology)
-        print("[info] no structured reason code — typology inferred from free "
-              "text. Ask partners for the raw reason code; it is far more reliable.")
+        logger.info("no structured reason code, so typology is inferred from free "
+                    "text. Ask partners for the raw reason code; it is far more reliable.")
     else:
         out["fraud_type"] = None
 
     unresolved = out["partner_reference"].isna() & out["partner_txn_id"].isna()
     if unresolved.any():
-        print(f"[WARN] {unresolved.sum()} chargeback rows have no usable join key.")
+        logger.warning(f"{unresolved.sum()} chargeback rows have no usable join key.")
 
-    print(f"[chargebacks] parsed {len(out)} rows")
+    logger.info(f"[chargebacks] parsed {len(out)} rows")
     if out["fraud_type"].notna().any():
-        print("   typology mix:")
+        logger.info("   typology mix:")
         for k, v in out["fraud_type"].value_counts().items():
-            print(f"      {k}: {v}")
+            logger.info(f"      {k}: {v}")
     return out
 
 
@@ -156,31 +163,35 @@ def match_to_transfers(cb: pd.DataFrame, transfers: pd.DataFrame) -> pd.DataFram
     out = cb.copy()
     out["_id"] = matched
     rate = out["_id"].notna().mean() * 100 if len(out) else 0
-    print(f"[chargebacks] matched {out['_id'].notna().sum()}/{len(out)} "
-          f"({rate:.1f}%) to transfers")
+    logger.info(f"[chargebacks] matched {out['_id'].notna().sum()}/{len(out)} "
+                f"({rate:.1f}%) to transfers")
     if rate < 90:
-        print("   [WARN] low match rate. Check: (a) ID formatting/prefixes differ "
-              "between partner sheet and our records, (b) some providers write no "
-              "partner reference at all — those chargebacks are unmatchable and "
-              "create label-coverage bias.")
+        logger.warning("low match rate. Check: (a) ID formatting/prefixes differ "
+                       "between partner sheet and our records, (b) some providers write no "
+                       "partner reference at all, meaning those chargebacks are unmatchable "
+                       "and create label-coverage bias.")
     return out
 
 
-def run(sheet_path, extracted_dir="data/extracted"):
+def run(sheet_path, extracted_dir=None):
+    setup_logging()
+    t0 = time.monotonic()
+    extracted_dir = _resolve(extracted_dir or config.EXTRACTED_DIR)
     p = _resolve(sheet_path)
     df = pd.read_excel(p) if p.suffix.lower() in {".xlsx", ".xls"} else pd.read_csv(p)
     cb = parse_chargebacks(df)
     from common import read_table
-    transfers = read_table(_resolve(extracted_dir) / "transfer")
+    transfers = read_table(extracted_dir / "transfer")
     cb = match_to_transfers(cb, transfers)
-    out = write_table(cb, _resolve(extracted_dir) / "chargebacks")
-    print(f"[write] {out}")
+    out = write_table(cb, extracted_dir / "chargebacks")
+    logger.info(f"[write] {out}  ({len(cb)} rows, {time.monotonic()-t0:.2f}s)")
     return cb
 
 
 if __name__ == "__main__":
     import sys
+    setup_logging()
     if len(sys.argv) < 2:
-        print("usage: python chargeback_parser.py <partner_sheet.csv|xlsx>")
+        logger.error("usage: python chargeback_parser.py <partner_sheet.csv|xlsx>")
     else:
         run(sys.argv[1])

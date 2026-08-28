@@ -1,5 +1,5 @@
 """
-label_builder.py — Phase C: derive per-transaction labels.
+label_builder.py, Phase C: derive per-transaction labels.
 
 LABEL SEMANTICS (confirmed business logic)
 ------------------------------------------
@@ -17,23 +17,29 @@ PRECEDENCE (highest authority first):
     3. assumed legitimate                     -> 0
 
 A chargeback OVERRIDES an unflag: if review cleared it but the card provider
-later charged it back, that is a false negative of the review process — the most
-valuable training example available.
+later charged it back, that is a false negative of the review process, and the
+most valuable training example available.
 
 THE BLIND SPOT: the assumed-legit bucket contains fraud the rules never caught.
 It is marked distinctly (never merged with confirmed-legit) so the model layer
 can weight, exclude, or overwrite it. `coverage` in the audit quantifies this.
 """
 
+import logging
+import time
 from collections import Counter
 from pathlib import Path
 
 import pandas as pd
 
-from common import read_table, write_table
+import config
+from common import read_table, setup_logging, write_table
 
 from pathlib import Path as _P
 ROOT = _P(__file__).resolve().parent.parent
+
+logger = logging.getLogger(__name__)
+
 
 def _resolve(p):
     """Resolve a path against the project root unless already absolute."""
@@ -49,6 +55,17 @@ SOURCE_ASSUMED    = "assumed_legit_never_flagged"
 
 def _resolve_flag_history(flags: pd.DataFrame) -> pd.DataFrame:
     """Latest event per transfer wins. Fails loudly on shape surprises."""
+    EMPTY = pd.DataFrame(columns=["_id", "label", "label_source", "verdict_date"])
+
+    # An empty flag collection is legitimate: a period with no flags raised, or a
+    # fresh deployment. Every transfer then falls through to assumed-legit.
+    # Checking .empty BEFORE the column check matters -- an empty DataFrame has
+    # no columns, so the schema check below would misreport it as the wrong
+    # collection entirely.
+    if flags is None or flags.empty:
+        logger.info("no flag documents; all transfers will be assumed-legit")
+        return EMPTY
+
     if "transfer" not in flags.columns:
         raise ValueError(
             "Flag table has no 'transfer' column. Is this the transfer-flag "
@@ -60,7 +77,7 @@ def _resolve_flag_history(flags: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(
             f"{missing} flag docs have a null 'transfer'. Every row in the "
             f"transfer-flag collection should reference a transfer. Investigate "
-            f"before proceeding — these would silently corrupt labels."
+            f"before proceeding, since these would silently corrupt labels."
         )
 
     unexpected = set(flags["action"].dropna().unique()) - {"flag", "unflag"}
@@ -89,7 +106,9 @@ def build_labels(flags: pd.DataFrame, transfers: pd.DataFrame,
     audit = Counter()
 
     latest = _resolve_flag_history(flags)
-    hist = flags.groupby("transfer").size()
+    hist = (flags.groupby("transfer").size()
+            if flags is not None and not flags.empty and "transfer" in flags.columns
+            else pd.Series(dtype=int))
     audit["transfers_with_flag_history"] = len(hist)
     audit["transfers_with_multiple_events"] = int((hist > 1).sum())
     audit["confirmed_fraud_upheld"] = int((latest["label"] == 1).sum())
@@ -101,9 +120,9 @@ def build_labels(flags: pd.DataFrame, transfers: pd.DataFrame,
 
     orphans = set(latest["_id"]) - set(transfers["_id"])
     if orphans:
-        print(f"[WARN] {len(orphans)} flag docs reference transfers absent from "
-              f"the transfer table (partial export, or deleted transfers). "
-              f"Those labels are unused.")
+        logger.warning(f"{len(orphans)} flag docs reference transfers absent from "
+                       f"the transfer table (partial export, or deleted transfers). "
+                       f"Those labels are unused.")
 
     # ── chargebacks override everything ─────────────────────────────────────
     if chargebacks is not None and len(chargebacks):
@@ -117,8 +136,8 @@ def build_labels(flags: pd.DataFrame, transfers: pd.DataFrame,
         audit["chargebacks_overriding_a_clear"] = overridden
         unmatched = len(cb_ids - set(out["_id"]))
         if unmatched:
-            print(f"[WARN] {unmatched} chargebacks could not be matched to a "
-                  f"transfer. Check the partner_reference join and ID formatting.")
+            logger.warning(f"{unmatched} chargebacks could not be matched to a "
+                           f"transfer. Check the partner_reference join and ID formatting.")
 
     never = out["label"].isna()
     audit["assumed_legit_never_flagged"] = int(never.sum())
@@ -128,33 +147,44 @@ def build_labels(flags: pd.DataFrame, transfers: pd.DataFrame,
 
     # ── report ──────────────────────────────────────────────────────────────
     total = len(out)
-    print("\n[label audit]")
+    logger.info("[label audit]")
     for k, v in audit.items():
-        print(f"   {k}: {v:,}")
-    print(f"   total transfers: {total:,}")
+        logger.info(f"   {k}: {v:,}")
+    logger.info(f"   total transfers: {total:,}")
     if total:
         reviewed = (out["label_source"] != SOURCE_ASSUMED).mean()
-        print(f"   fraud rate (as labeled): {out['label'].mean()*100:.3f}%")
-        print(f"   COVERAGE: {reviewed*100:.1f}% of transfers have a confirmed "
-              f"verdict; {(1-reviewed)*100:.1f}% are assumed-legit.")
-        print("   ^ Low coverage means the model largely learns to imitate the "
-              "existing rules. Partner/chargeback data is what fixes this.")
+        logger.info(f"   fraud rate (as labeled): {out['label'].mean()*100:.3f}%")
+        logger.info(f"   COVERAGE: {reviewed*100:.1f}% of transfers have a confirmed "
+                    f"verdict; {(1-reviewed)*100:.1f}% are assumed-legit.")
+        logger.info("   ^ Low coverage means the model largely learns to imitate the "
+                    "existing rules. Partner/chargeback data is what fixes this.")
     return out
 
 
-def run(extracted_dir="data/extracted"):
-    d = _resolve(extracted_dir)
-    flags = read_table(d / "flag")
+def run(extracted_dir=None):
+    setup_logging()
+    t0 = time.monotonic()
+    d = _resolve(extracted_dir or config.EXTRACTED_DIR)
+    try:
+        flags = read_table(d / "flag")
+    except FileNotFoundError:
+        # extractor.py writes no flag table at all when the source has zero
+        # flag documents (a fresh deployment, or an export period with none
+        # raised) -- that's the realistic trigger for the crash the empty-flags
+        # handling above guards against; _resolve_flag_history's `flags is None`
+        # branch takes it from here.
+        flags = None
+        logger.info("no flag table on disk; all transfers will be assumed-legit")
     transfers = read_table(d / "transfer")
     try:
         chargebacks = read_table(d / "chargebacks")
     except FileNotFoundError:
         chargebacks = None
-        print("[info] no chargeback table yet — labels from flag documents only.")
+        logger.info("no chargeback table yet, so labels come from flag documents only.")
 
     labels = build_labels(flags, transfers, chargebacks)
     out = write_table(labels, d / "labels")
-    print(f"\n[write] {out}  ({len(labels):,} rows)")
+    logger.info(f"[write] {out}  ({len(labels):,} rows, {time.monotonic()-t0:.2f}s)")
     return labels
 
 

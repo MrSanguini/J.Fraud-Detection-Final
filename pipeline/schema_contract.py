@@ -1,5 +1,5 @@
 """
-schema_contract.py — the single source of truth for the fraud-data pipeline.
+schema_contract.py: the single source of truth for the fraud-data pipeline.
 
 DECLARATIVE ONLY. No data is read or transformed here. The extractor and feature
 assembler import these tables and act on them.
@@ -15,7 +15,7 @@ Four axes per field:
               META    -> pipeline logic only (timestamps, cost figures)
               DROP    -> excluded; reason recorded for audit
 
-  sensitivity SENSITIVE (PII/secret — never reaches output)
+  sensitivity SENSITIVE (PII/secret; never reaches output)
               INTERNAL  (safe to use)
 
   mutability  IMMUTABLE -> written once at creation; safe for ALL records
@@ -29,7 +29,7 @@ Four axes per field:
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  CANONICAL FIELDS — solve the provider schema-variance problem.
+#  CANONICAL FIELDS: solve the provider schema-variance problem.
 #
 #  `paymentProvider` is a DISCRIMINATOR: its value determines which other fields
 #  exist. Confirmed across 4 provider variants (truelayer/checkout/nmi/omnex):
@@ -42,13 +42,13 @@ Four axes per field:
 #  We therefore extract BOTH keys to maximise chargeback join coverage.
 # ─────────────────────────────────────────────────────────────────────────────
 CANONICAL = {
-    # primary partner reference — first non-null wins, in this order
+    # primary partner reference: first non-null wins, in this order
     "partner_reference": {
         "sources": ["omnexPaymentId", "payment_receipt_number", "transaction_id"],
         "action": "HASH",
         "reason": "partner-side ID; name varies by paymentProvider. Chargeback FOLIO joins here.",
     },
-    # secondary/universal reference — present on all four providers
+    # secondary/universal reference, present on all four providers
     "partner_txn_id": {
         "sources": ["omnexPaymentMtn", "transaction_id"],
         "action": "HASH",
@@ -57,7 +57,7 @@ CANONICAL = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  TRANSFER DOCUMENT — immutable core. Most Tier-1 signal lives here.
+#  TRANSFER DOCUMENT: immutable core. Most Tier-1 signal lives here.
 # ─────────────────────────────────────────────────────────────────────────────
 TRANSFER = {
     "_id":                  ("HASH",   "INTERNAL",  "IMMUTABLE", 1, "transaction id / label join key"),
@@ -92,7 +92,7 @@ TRANSFER = {
 
     # ── card / payment intelligence (provider-variant fields) ───────────────
     "network_name":         ("KEEP",   "INTERNAL",  "IMMUTABLE", 1, "card network: Visa/Mastercard (checkout, nmi)"),
-    "avs_code":             ("KEEP",   "INTERNAL",  "IMMUTABLE", 1, "address verification result — real fraud signal (nmi)"),
+    "avs_code":             ("KEEP",   "INTERNAL",  "IMMUTABLE", 1, "address verification result, a real fraud signal (nmi)"),
     "risk_score":           ("KEEP",   "INTERNAL",  "IMMUTABLE", 1, "partner's own auth-time risk score, if supplied"),
 
     # ── 3-D Secure family ───────────────────────────────────────────────────
@@ -134,7 +134,7 @@ TRANSFER = {
     "payout_partner_status":  ("DROP", "INTERNAL", "MUTABLE", 0, "LEAKAGE: payout outcome, post-score"),
     "isPendingPayment":       ("DROP", "INTERNAL", "MUTABLE", 0, "LEAKAGE: lifecycle state"),
     "flag_status":            ("DROP", "INTERNAL", "MUTABLE", 0, "LEAKAGE: shadow of the label"),
-    "date_flagged":           ("DROP", "INTERNAL", "MUTABLE", 0, "LEAKAGE: appears on nmi transfers — label shadow"),
+    "date_flagged":           ("DROP", "INTERNAL", "MUTABLE", 0, "LEAKAGE: appears on nmi transfers, a label shadow"),
     "retry":                  ("DROP", "INTERNAL", "MUTABLE", 0, "post-hoc lifecycle"),
     "retry_receipt_number":   ("DROP", "INTERNAL", "MUTABLE", 0, "post-hoc retries"),
     "paymentWebhooks":        ("DROP", "INTERNAL", "MUTABLE", 0, "post-score settlement events"),
@@ -179,7 +179,7 @@ TRANSFER = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  USER DOCUMENT — Tier 2 unless STATIC (create-once). Documents are NOT
+#  USER DOCUMENT: Tier 2 unless STATIC (create-once). Documents are NOT
 #  snapshotted at transfer time for historical records, so MUTABLE fields are
 #  only trustworthy on future records that carry the snapshot.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -264,7 +264,7 @@ USER = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  RECIPIENT DOCUMENT — date_created is STATIC (Tier 1, high signal).
+#  RECIPIENT DOCUMENT: date_created is STATIC (Tier 1, high signal).
 # ─────────────────────────────────────────────────────────────────────────────
 RECIPIENT = {
     "_id":                  ("HASH",   "INTERNAL",  "IMMUTABLE", 1, "join key -> transfer.recipient_id"),
@@ -298,7 +298,7 @@ RECIPIENT = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  FLAG DOCUMENTS (transfer-flag collection) — label + timestamp only.
+#  FLAG DOCUMENTS (transfer-flag collection): label + timestamp only.
 #  APPEND-ONLY: every flag/unflag creates a NEW document. Latest event wins.
 # ─────────────────────────────────────────────────────────────────────────────
 FLAG = {

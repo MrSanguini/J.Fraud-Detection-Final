@@ -1,8 +1,8 @@
 """
-extractor.py — Phase B: flatten raw JSON collections into clean flat tables.
+extractor.py, Phase B: flatten raw JSON collections into clean flat tables.
 
-Reads schema_contract.py and applies it mechanically. It is a DUMB FLATTENER by
-design — no feature engineering here, so it stays auditable.
+Reads schema_contract.py and applies it mechanically. It is a DUMB FLATTENER
+by design, with no feature engineering here, so it stays auditable.
 
 Two exceptions to "dumb": it resolves CANONICAL fields (provider aliases -> one
 column), and it derives sensitive values IMMEDIATELY (email -> domain) so raw
@@ -12,16 +12,22 @@ SECURITY MODEL: exclusion, not obfuscation. Sensitive fields are DROPPED, not
 hashed. Hashing is used only for non-sensitive join keys that must stay linkable.
 """
 
+import logging
+import time
 from collections import Counter
 from pathlib import Path
 
 import pandas as pd
 
-from common import get_salt, hash_id, load_json, read_field, write_table
+import config
+from common import ChunkedWriter, get_salt, hash_id, iter_documents, read_field, setup_logging
 from schema_contract import CANONICAL, CONTRACTS
 
 from pathlib import Path as _P
 ROOT = _P(__file__).resolve().parent.parent
+
+logger = logging.getLogger(__name__)
+
 
 def _resolve(p):
     """Resolve a path against the project root unless already absolute."""
@@ -58,7 +64,9 @@ def resolve_canonical(doc: dict, spec: dict):
     return None, None
 
 
-def extract_collection(docs: list[dict], doc_type: str) -> pd.DataFrame:
+def extract_collection(docs: list[dict], doc_type: str) -> tuple[pd.DataFrame, Counter, Counter]:
+    """Flatten one batch of documents. Pure (no I/O, no printing), so it can
+    be called once per chunk without needing the whole collection in memory."""
     contract = CONTRACTS[doc_type]
     rows, audit = [], Counter()
     canon_sources = Counter()
@@ -101,44 +109,61 @@ def extract_collection(docs: list[dict], doc_type: str) -> pd.DataFrame:
 
         rows.append(row)
 
-    df = pd.DataFrame(rows)
-    print(f"[extract:{doc_type}] {audit['docs']} docs -> {df.shape[1]} cols "
-          f"({audit.get('missing_tier2',0)} tier-2 field misses, expected on "
-          f"historical records)")
-    if canon_sources:
-        print("   canonical resolution:")
-        for k, v in canon_sources.most_common():
-            flag = "  !! unjoinable to chargebacks" if "UNRESOLVED" in k else ""
-            print(f"      {k}: {v}{flag}")
-    return df
+    return pd.DataFrame(rows), audit, canon_sources
 
 
-def run(data_dir="data", out_dir="data/extracted"):
-    data_dir, out_dir = _resolve(data_dir), _resolve(out_dir)
+def run(data_dir=None, out_dir=None, limit=None, batch_size=None):
+    """Streams each collection through in batches of `batch_size` documents
+    (read, flatten, write, discard), so peak RAM is bounded by one batch, not
+    the whole collection. Only the transfer collection is expected to reach
+    millions of rows; see `common.iter_documents` for why the smaller
+    auxiliary collections (users/recipients/flags) don't get the same true
+    streaming under the "files" backend.
+
+    Where documents actually come from (local export files vs. a live Mongo
+    deployment) is entirely config.DATA_SOURCE's call, via
+    `common.iter_documents`; this function never sees a filename or a
+    collection name."""
+    setup_logging()
+    out_dir = _resolve(out_dir or config.EXTRACTED_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
+    batch_size = batch_size or config.BATCH_SIZE
 
-    # Multiple files per collection are concatenated — this is how provider
-    # variants (which may be exported separately) get unified.
-    collections = {
-        "transfer":  ["transfers.json", "transfer.json", "checkout_transfers.json",
-                      "nmi_transfers.json", "omnex_transfers.json"],
-        "user":      ["users.json", "user.json"],
-        "recipient": ["recipients.json"],
-        "flag":      ["transfer_flags.json", "flags.json"],
-    }
+    rows_by_type = {}
+    for doc_type in config.DOC_TYPES:
+        t0 = time.monotonic()
+        writer = ChunkedWriter(out_dir / doc_type)
+        audit, canon_sources = Counter(), Counter()
+        n_cols = None
 
-    for doc_type, filenames in collections.items():
-        docs = []
-        for fn in filenames:
-            p = data_dir / fn
-            if p.exists():
-                docs.extend(load_json(p))
-        if not docs:
-            print(f"[skip] no files for {doc_type}")
+        for batch in iter_documents(doc_type, data_dir=data_dir,
+                                    batch_size=batch_size, limit=limit):
+            df, batch_audit, batch_canon = extract_collection(batch, doc_type)
+            audit.update(batch_audit)
+            canon_sources.update(batch_canon)
+            if n_cols is None:
+                n_cols = df.shape[1]
+            writer.write_batch(df)
+
+        out = writer.close()
+        if out is None:
+            logger.info(f"[skip] no documents found for {doc_type}")
             continue
-        df = extract_collection(docs, doc_type)
-        out = write_table(df, out_dir / doc_type)
-        print(f"[write] {out}  ({len(df)} rows)")
+
+        elapsed = time.monotonic() - t0
+        logger.info(f"[extract:{doc_type}] {audit['docs']} docs -> {n_cols} cols, "
+                    f"written in batches of {batch_size} "
+                    f"({audit.get('missing_tier2',0)} tier-2 field misses, expected on "
+                    f"historical records)")
+        if canon_sources:
+            logger.info("   canonical resolution:")
+            for k, v in canon_sources.most_common():
+                flag = "  !! unjoinable to chargebacks" if "UNRESOLVED" in k else ""
+                logger.info(f"      {k}: {v}{flag}")
+        logger.info(f"[write] {out}  ({writer.rows_written} rows, {elapsed:.2f}s)")
+        rows_by_type[doc_type] = writer.rows_written
+
+    return rows_by_type
 
 
 if __name__ == "__main__":

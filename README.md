@@ -125,9 +125,13 @@ question to IT; usually they don't).
 a *later* declined transaction — so the transaction that caused it is unlabeled.
 Ask partners to report which transaction triggered a watchlisting.
 
-**`description_code` format is inconsistent** — `"10"` in newer records vs an
-ObjectId string in older ones. Needs normalising before it is a usable
-categorical.
+**`description_code` mixed two formats.** `"10"`-style short codes on newer
+records, a 24-char ObjectId string on older ones. `assembler.py`'s
+`normalize_description_code()` now buckets the ObjectId form into a single
+`"legacy"` value and logs the short-code/legacy/missing ratio every run,
+warning if legacy is the majority. There's no lookup table in this repo to
+resolve those ObjectIds back to a real code; if one turns up, replace the
+bucket with a real join.
 
 ---
 

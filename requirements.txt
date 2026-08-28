@@ -6,3 +6,13 @@ xgboost
 lightgbm
 optuna
 openpyxl
+joblib
+
+# API layer (api/scoring, api/training). Not needed to run the pipeline or
+# train from the command line.
+fastapi
+uvicorn[standard]
+
+# test-only: pytest's FastAPI TestClient needs httpx
+pytest
+httpx
