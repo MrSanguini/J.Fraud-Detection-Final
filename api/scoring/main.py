@@ -42,6 +42,16 @@ def _load_artifacts() -> dict:
     import json
 
     art = Path(config.ARTIFACTS_DIR)
+
+    # In a deploy environment (Render, etc.) the repo carries no artifacts --
+    # they are gitignored build outputs. Fetch them from ARTIFACT_URL if absent.
+    # No-op when they are already on disk, so local runs are unaffected.
+    try:
+        from artifact_store import ensure_artifacts
+        ensure_artifacts(art)
+    except ImportError:
+        pass
+
     prep_path = art / "model_prep.joblib"
     cal_path = art / "calibrator.joblib"
     results_path = art / "training_results.json"

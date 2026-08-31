@@ -17,38 +17,11 @@ Stages:
     D  assembler           join + features -> training table
     E  test_pipeline       safety assertions (PII / identity / leakage)
 
-Stage E is not optional in spirit: it is the check that this ran correctly on
-data nobody watched it process. It always runs: it has no output table of its
-own to checkpoint against, and it's the thing that catches a stale resume.
-
-CHECKPOINTING: before B/C0/C/D each run, if that stage's output table already
-exists on disk, the stage is skipped (and this is logged). This makes a
-crashed run resumable for free: just re-invoke the same command. Two ways to
-override: --force re-runs every stage regardless of what's on disk; --from-
-stage NAME skips straight to that stage (no existence check for it or
-anything after, an unconditional "start here").
-
-GOTCHA: checkpoints are pure "does the file exist"; a table written by a
---limit smoke run looks identical to a full run. Pass --force after a smoke
-test before the real run, or you'll silently keep the smoke-run output.
-
-LOGGING: every run configures the `logging` module once (console plus
-logs/pipeline_<UTC timestamp>.log) and logs elapsed time and a row count for
-every stage; that per-stage timing is your performance baseline for sizing
-a real, billed run from a smaller one.
-
 CONFIG: paths, collection names, batch size, velocity windows, and
 FP_UNIT_COST all live in config.py, not in this file or any stage module.
 Switching the source from local JSON exports to a live Mongo/Atlas
 deployment is config.DATA_SOURCE = "atlas" plus MONGO_URI/MONGO_DB as
 environment variables; nothing in pipeline/*.py needs to change.
-
-OUTPUT REDIRECTION: --data-dir controls where SOURCE data is read from,
-but output (data/extracted, data/training_set, artifacts/, logs/) always
-lands under config.OUTPUT_ROOT, which defaults to the project root. Set
-PIPELINE_OUTPUT_ROOT to redirect all of it elsewhere in one move -- e.g.
-the test suite points it at testing/test_outputs/ so pytest never touches
-the real project directories.
 """
 
 import argparse

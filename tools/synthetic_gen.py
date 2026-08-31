@@ -1,7 +1,7 @@
 """
-generate_synthetic.py — produce realistic fake data for local pipeline testing.
+synthetic_gen.py — produce realistic fake data for local pipeline testing.
 
-    python tools/generate_synthetic.py --n-transfers 100000
+    python tools/synthetic_gen.py --n-transfers 100000
 
 Produces five files matching the real schema:
     transfers.json          all 4 provider variants with their real field differences
@@ -9,24 +9,6 @@ Produces five files matching the real schema:
     recipients.json         referenced by transfers
     transfer_flags.json     APPEND-ONLY history (flag -> unflag -> re-flag)
     partner_chargebacks.csv FOLIOs matching the correct partner-reference per provider
-
-DESIGN NOTES
-------------
-This is ~90% hand-written logic. Faker is used only for the handful of fields where
-human-readable output helps when eyeballing output; those fields are all DROP in the
-schema contract anyway, so their content is irrelevant to the model. Faker values are
-POOLED (a few thousand generated once, then sampled) because per-row Faker calls
-dominate runtime at scale — and pooling is more realistic anyway, since real users
-appear across many transactions.
-
-Everything that actually matters comes from numpy: amount distributions, timestamp
-spacing, categorical cardinality, and the correlations that make fraud learnable.
-
-LABEL STRUCTURE reproduces the real blind spot:
-    ~40% of fraud is caught by rules      -> flag document (latest action = "flag")
-    ~60% of fraud is NEVER caught         -> chargeback ONLY (invisible to the rules)
-    some legitimate transfers are flagged -> then unflagged (false positives)
-This is what lets you test label precedence and see a realistic COVERAGE figure.
 """
 
 import argparse

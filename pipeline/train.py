@@ -1,29 +1,7 @@
 """
 train.py, L2.3: train, tune, calibrate, and evaluate the fraud model.
 
-    python src/train.py --trials 20
-
-DISCIPLINE THIS FILE ENFORCES
-----------------------------
-1. TEMPORAL SPLIT, never random. Handled upstream by model_prep.
-2. EVERY DECISION IS MADE ON VALIDATION. Hyperparameters, the winning model, the
-   calibrator, and the decision threshold are all chosen on val. Test is read
-   ONCE, at the end, at the already-fixed threshold.
-   Choosing the threshold on test means minimising cost against the very data you
-   then report, which is optimistically biased. The gap between the val figure and
-   the test figure IS that optimism -- expect test to look slightly worse, and
-   trust it.
-3. CALIBRATION IS NOT COSMETIC. scale_pos_weight inflates raw scores, so an
-   uncalibrated "0.6" is not a 60% fraud probability. The rules layer thresholds
-   on these probabilities and the UI shows them to humans, so they must mean what
-   they say. Isotonic regression is monotonic, so it will NOT change AUROC/PR-AUC
-   -- it fixes interpretability and downstream behaviour, not ranking.
-
-SPEED NOTES (learned the hard way: a 30-trial run once took 10 hours)
-   * tune on a ROW SUBSAMPLE; hyperparameters transfer, and it is ~3x faster
-   * cap max_depth at 8; depth 9-10 trials are individually brutal
-   * lower n_estimators during search, raise it for the final refit
-   * PERSIST the Optuna study, so an interrupted run resumes instead of restarting
+    python pipeline/train.py --trials 20
 """
 
 import argparse

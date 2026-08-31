@@ -125,7 +125,15 @@ def cost(y_true, y_scores, amounts, threshold: float,
 
     fn_cost = float(amounts[fn_mask].sum() * fn_loss_fraction
                     + fn_mask.sum() * fn_fixed_cost)
-    fp_cost = float(fp_mask.sum() * fp_unit_cost)
+
+    # fp_unit_cost accepts a SCALAR (one flat cost for every transaction) or an
+    # ARRAY aligned to y_true (a per-transaction cost, e.g. from
+    # aggressiveness.build_fp_costs, where a wrongly-blocked $4,000 transfer
+    # costs more than a wrongly-blocked $20 one). broadcast_to handles both, so
+    # existing scalar callers are unaffected.
+    fp_costs = np.broadcast_to(np.asarray(fp_unit_cost, dtype=float),
+                               y_true.shape)
+    fp_cost = float(fp_costs[fp_mask].sum())
     total = fn_cost + fp_cost
     n = len(y_true)
     return {
