@@ -48,9 +48,10 @@ def _load_artifacts() -> dict:
     # No-op when they are already on disk, so local runs are unaffected.
     try:
         from artifact_store import ensure_artifacts
-        ensure_artifacts(art)
-    except ImportError:
-        pass
+        fetched = ensure_artifacts(art)
+        print(f"[artifact_store] ensure_artifacts returned {fetched}", flush=True)
+    except ImportError as e:
+        print(f"[artifact_store] IMPORT FAILED: {e}", flush=True)
 
     prep_path = art / "model_prep.joblib"
     cal_path = art / "calibrator.joblib"
