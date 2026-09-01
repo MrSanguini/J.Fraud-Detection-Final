@@ -108,7 +108,22 @@ def get_salt() -> bytes:
 # ── Mongo export handling ────────────────────────────────────────────────────
 def unwrap(v):
     """Mongo wraps values: {'$oid':..}, {'$date':..}, {'$numberLong':..}.
-    Return the plain scalar underneath. Handles nested $date/$numberLong."""
+    Return the plain scalar underneath. Handles nested $date/$numberLong.
+
+    Also normalises the NATIVE types pymongo returns (DATA_SOURCE == "atlas"),
+    so both backends produce identical output for the same document:
+
+      ObjectId  handled downstream -- hash_id() calls str(), and
+                bson.ObjectId.__str__ is the bare hex, matching the {'$oid':..}
+                string a JSON export yields. No conversion needed here.
+      datetime  converted to an ISO string. A JSON export gives a string, so
+                without this the two backends would disagree once written to
+                CSV (`2026-07-09 11:59:19` vs `2026-07-09T11:59:19.547Z`).
+                Parquet preserves dtypes and would not show the difference,
+                which is exactly what makes it worth pinning explicitly.
+    """
+    if isinstance(v, datetime):
+        return v.isoformat()
     if isinstance(v, dict):
         if "$oid" in v:
             return v["$oid"]
